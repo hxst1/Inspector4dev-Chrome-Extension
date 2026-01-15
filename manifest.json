@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Inspector4dev",
-  "version": "1.0.0",
+  "version": "1.3.2",
   "description": "Inspecciona elementos web de forma rápida y elegante.",
   "author": "Edu Ruiz",
   "permissions": ["activeTab", "storage"],

@@ -1,6 +1,6 @@
 /**
- * Inspector 4 dev - Content Script v2.1
- * Features: Extended tooltip, color picker mode, collapsible SVGs, OS-aware shortcuts
+ * Inspector 4 dev - Content Script v2.4
+ * ColorZilla-style pixel color picker + Fixed Box Model
  */
 
 (function () {
@@ -9,7 +9,7 @@
   if (window.__elementInspectorPro) return;
   window.__elementInspectorPro = true;
 
-  const isMac = navigator.platform.toUpperCase().indexOf("MAC") >= 0;
+  const isMac = /Mac|iPod|iPhone|iPad/.test(navigator.platform);
 
   let state = {
     enabled: false,
@@ -21,11 +21,11 @@
     isDragging: false,
     dragOffset: { x: 0, y: 0 },
     panelPosition: { x: null, y: null },
+    lastMousePos: { x: 0, y: 0 },
     settings: {
       darkMode: true,
       extendedTooltip: false,
       showDimensions: true,
-      colorPickerMode: false,
       collapseSvgs: true,
     },
   };
@@ -44,25 +44,28 @@
     export: `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><polyline points="14,2 14,8 20,8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg>`,
     check: `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="20,6 9,17 4,12"/></svg>`,
     chevron: `<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6,9 12,15 18,9"/></svg>`,
+    eyedropper: `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m2 22 1-1h3l9-9M3 21v-3l9-9"/><path d="m15 6 3-3 3 3-3 3"/></svg>`,
   };
 
   async function init() {
-    const stored = await chrome.storage.local.get([
-      "inspectorEnabled",
-      "darkMode",
-      "extendedTooltip",
-      "showDimensions",
-      "colorPickerMode",
-      "collapseSvgs",
-    ]);
-    state.settings.darkMode = stored.darkMode !== false;
-    state.settings.extendedTooltip = stored.extendedTooltip || false;
-    state.settings.showDimensions = stored.showDimensions !== false;
-    state.settings.colorPickerMode = stored.colorPickerMode || false;
-    state.settings.collapseSvgs = stored.collapseSvgs !== false;
-    if (stored.inspectorEnabled) enableInspector();
+    try {
+      const stored = await chrome.storage.local.get([
+        "inspectorEnabled",
+        "darkMode",
+        "extendedTooltip",
+        "showDimensions",
+        "collapseSvgs",
+      ]);
+      state.settings.darkMode = stored.darkMode !== false;
+      state.settings.extendedTooltip = stored.extendedTooltip || false;
+      state.settings.showDimensions = stored.showDimensions !== false;
+      state.settings.collapseSvgs = stored.collapseSvgs !== false;
+      if (stored.inspectorEnabled) enableInspector();
+    } catch (e) {
+      console.log("Inspector init without storage");
+    }
     chrome.runtime.onMessage.addListener(handleMessage);
-    document.addEventListener("keydown", handleKeyboard);
+    document.addEventListener("keydown", handleKeyboard, true);
   }
 
   function handleMessage(message, sender, sendResponse) {
@@ -83,18 +86,25 @@
   }
 
   function handleKeyboard(e) {
-    const modKey = isMac ? e.altKey : e.altKey;
-    if (modKey && e.key.toLowerCase() === "i") {
+    if (e.altKey && (e.key === "i" || e.key === "I" || e.code === "KeyI")) {
       e.preventDefault();
-      state.enabled ? disableInspector() : enableInspector();
-      chrome.storage.local.set({ inspectorEnabled: state.enabled });
+      e.stopPropagation();
+      const newState = !state.enabled;
+      newState ? enableInspector() : disableInspector();
+      try {
+        chrome.storage.local.set({ inspectorEnabled: newState });
+      } catch (err) {}
+      return;
     }
+
     if (e.key === "Escape") {
       if (state.assetsPanel) closeAssetsPanel();
       else if (state.panel) closePanel();
     }
+
+    // C = Copy color under cursor (ColorZilla style)
     if (
-      e.key.toLowerCase() === "c" &&
+      (e.key === "c" || e.key === "C") &&
       state.enabled &&
       !e.ctrlKey &&
       !e.metaKey
@@ -102,15 +112,12 @@
       const active = document.activeElement;
       if (active.tagName !== "INPUT" && active.tagName !== "TEXTAREA") {
         e.preventDefault();
-        if (state.settings.colorPickerMode && state.currentElement) {
-          copyColorUnderCursor();
-        } else if (state.panel && state.currentElement) {
-          copyElementColor();
-        }
+        captureColorUnderCursor();
       }
     }
+
     if (
-      e.key.toLowerCase() === "a" &&
+      (e.key === "a" || e.key === "A") &&
       state.enabled &&
       !e.ctrlKey &&
       !e.metaKey
@@ -120,6 +127,121 @@
         e.preventDefault();
         state.assetsPanel ? closeAssetsPanel() : showAssetsPanel();
       }
+    }
+  }
+
+  /**
+   * Capture the color of the pixel under the cursor using html2canvas-like approach
+   */
+  async function captureColorUnderCursor() {
+    const x = state.lastMousePos.x;
+    const y = state.lastMousePos.y;
+
+    // Get element at cursor position
+    const element = document.elementFromPoint(x, y);
+    if (!element) {
+      showToast("No se pudo detectar elemento", "error");
+      return;
+    }
+
+    // Check if it's an image
+    if (element.tagName === "IMG") {
+      const color = await getColorFromImage(element, x, y);
+      if (color) {
+        await copyToClipboard(color);
+        showToast(`Color copiado: ${color}`, "success");
+        return;
+      }
+    }
+
+    // Check if it's a canvas
+    if (element.tagName === "CANVAS") {
+      const color = getColorFromCanvas(element, x, y);
+      if (color) {
+        await copyToClipboard(color);
+        showToast(`Color copiado: ${color}`, "success");
+        return;
+      }
+    }
+
+    // For regular elements, get computed background or color
+    const styles = window.getComputedStyle(element);
+    let color = styles.backgroundColor;
+
+    // If background is transparent, try to get the color
+    if (color === "rgba(0, 0, 0, 0)" || color === "transparent") {
+      color = styles.color;
+    }
+
+    // If still transparent, walk up the DOM to find a colored parent
+    if (color === "rgba(0, 0, 0, 0)" || color === "transparent") {
+      let parent = element.parentElement;
+      while (parent) {
+        const parentStyles = window.getComputedStyle(parent);
+        if (
+          parentStyles.backgroundColor !== "rgba(0, 0, 0, 0)" &&
+          parentStyles.backgroundColor !== "transparent"
+        ) {
+          color = parentStyles.backgroundColor;
+          break;
+        }
+        parent = parent.parentElement;
+      }
+    }
+
+    const hexColor = rgbToHex(color);
+    await copyToClipboard(hexColor);
+    showToast(`Color copiado: ${hexColor}`, "success");
+  }
+
+  /**
+   * Get color from an image element at specific coordinates
+   */
+  async function getColorFromImage(img, pageX, pageY) {
+    try {
+      const rect = img.getBoundingClientRect();
+      const x = pageX - rect.left;
+      const y = pageY - rect.top;
+
+      // Calculate the actual pixel position in the image
+      const scaleX = img.naturalWidth / rect.width;
+      const scaleY = img.naturalHeight / rect.height;
+      const pixelX = Math.floor(x * scaleX);
+      const pixelY = Math.floor(y * scaleY);
+
+      const canvas = document.createElement("canvas");
+      canvas.width = img.naturalWidth;
+      canvas.height = img.naturalHeight;
+      const ctx = canvas.getContext("2d");
+
+      // Handle CORS - try to draw the image
+      ctx.drawImage(img, 0, 0);
+
+      try {
+        const pixel = ctx.getImageData(pixelX, pixelY, 1, 1).data;
+        return rgbToHex(`rgb(${pixel[0]}, ${pixel[1]}, ${pixel[2]})`);
+      } catch (e) {
+        // CORS error - fall back to computed style
+        return null;
+      }
+    } catch (e) {
+      return null;
+    }
+  }
+
+  /**
+   * Get color from a canvas element at specific coordinates
+   */
+  function getColorFromCanvas(canvas, pageX, pageY) {
+    try {
+      const rect = canvas.getBoundingClientRect();
+      const x = Math.floor((pageX - rect.left) * (canvas.width / rect.width));
+      const y = Math.floor((pageY - rect.top) * (canvas.height / rect.height));
+      const ctx = canvas.getContext("2d");
+      const pixel = ctx.getImageData(x, y, 1, 1).data;
+      return rgbToHex(`rgb(${pixel[0]}, ${pixel[1]}, ${pixel[2]})`);
+    } catch (e) {
+      return null;
     }
   }
 
@@ -157,6 +279,9 @@
   }
 
   function handleMouseMove(e) {
+    // Always track mouse position for color picker
+    state.lastMousePos = { x: e.clientX, y: e.clientY };
+
     if (!state.enabled) return;
     if (isInspectorElement(e.target)) {
       hideTooltip();
@@ -215,9 +340,9 @@
       const fontSize = styles.fontSize;
       extendedInfo = `
         <div class="eip-tooltip-extended">
-          <span class="eip-tooltip-color" style="--color: ${styles.color}"></span>
+          <span class="eip-tooltip-color" style="--swatch-color: ${styles.color}"></span>
           <span class="eip-tooltip-color-value">${textColor}</span>
-          <span class="eip-tooltip-color" style="--color: ${styles.backgroundColor}"></span>
+          <span class="eip-tooltip-color" style="--swatch-color: ${styles.backgroundColor}"></span>
           <span class="eip-tooltip-color-value">${bgColor}</span>
           <span class="eip-tooltip-font">${fontSize}</span>
         </div>
@@ -260,7 +385,7 @@
     state.badge = document.createElement("div");
     state.badge.className = "eip-badge";
     state.badge.innerHTML = `${icons.logo}<span class="eip-badge-text">Inspector ON</span>`;
-    state.badge.title = `Inspector 4 dev - Activo (${isMac ? "⌥" : "Alt"}+I para desactivar)`;
+    state.badge.title = `Inspector 4 dev (${isMac ? "⌥" : "Alt"}+I)`;
     state.badge.addEventListener("click", () =>
       state.assetsPanel ? closeAssetsPanel() : showAssetsPanel(),
     );
@@ -326,7 +451,21 @@
       .join("");
     const textColor = rgbToHex(styles.color);
     const bgColor = rgbToHex(styles.backgroundColor);
-    const modKey = isMac ? "⌥" : "Alt";
+
+    const mt = parseInt(styles.marginTop) || 0;
+    const mr = parseInt(styles.marginRight) || 0;
+    const mb = parseInt(styles.marginBottom) || 0;
+    const ml = parseInt(styles.marginLeft) || 0;
+    const bt = parseInt(styles.borderTopWidth) || 0;
+    const br = parseInt(styles.borderRightWidth) || 0;
+    const bb = parseInt(styles.borderBottomWidth) || 0;
+    const bl = parseInt(styles.borderLeftWidth) || 0;
+    const pt = parseInt(styles.paddingTop) || 0;
+    const pr = parseInt(styles.paddingRight) || 0;
+    const pb = parseInt(styles.paddingBottom) || 0;
+    const pl = parseInt(styles.paddingLeft) || 0;
+    const w = Math.round(rect.width);
+    const h = Math.round(rect.height);
 
     return `
       <div class="eip-panel-header">
@@ -345,11 +484,11 @@
             ${id ? `<span class="eip-element-id">${id}</span>` : ""}
             ${classes ? `<span class="eip-element-class">${classes}</span>` : ""}
           </div>
-          <div class="eip-element-size">${Math.round(rect.width)} × ${Math.round(rect.height)} px</div>
+          <div class="eip-element-size">${w} × ${h} px</div>
         </div>
 
         <div class="eip-section eip-color-quick">
-          <div class="eip-color-card" data-color="${textColor}" data-type="text" title="Click para copiar color de texto">
+          <div class="eip-color-card" data-color="${textColor}" title="Click para copiar">
             <div class="eip-color-swatch-lg" style="background: ${styles.color}"></div>
             <div class="eip-color-info">
               <span class="eip-color-label">Color</span>
@@ -357,7 +496,7 @@
             </div>
             <span class="eip-copy-indicator">${icons.copy}</span>
           </div>
-          <div class="eip-color-card" data-color="${bgColor}" data-type="bg" title="Click para copiar background">
+          <div class="eip-color-card" data-color="${bgColor}" title="Click para copiar">
             <div class="eip-color-swatch-lg" style="background: ${styles.backgroundColor}"></div>
             <div class="eip-color-info">
               <span class="eip-color-label">Background</span>
@@ -424,35 +563,29 @@
           </h4>
           <div class="eip-section-content">
             <div class="eip-box-model">
-              <div class="eip-box-layer eip-box-margin">
+              <div class="eip-box-margin">
                 <span class="eip-box-label">margin</span>
-                <div class="eip-box-values"><span>${parseInt(styles.marginTop)}</span></div>
-                <div class="eip-box-horizontal">
-                  <span>${parseInt(styles.marginLeft)}</span>
-                  <div class="eip-box-layer eip-box-border">
-                    <span class="eip-box-label">border</span>
-                    <div class="eip-box-values"><span>${parseInt(styles.borderTopWidth)}</span></div>
-                    <div class="eip-box-horizontal">
-                      <span>${parseInt(styles.borderLeftWidth)}</span>
-                      <div class="eip-box-layer eip-box-padding">
-                        <span class="eip-box-label">padding</span>
-                        <div class="eip-box-values"><span>${parseInt(styles.paddingTop)}</span></div>
-                        <div class="eip-box-horizontal">
-                          <span>${parseInt(styles.paddingLeft)}</span>
-                          <div class="eip-box-layer eip-box-content">
-                            <div class="eip-box-size">${Math.round(rect.width)} × ${Math.round(rect.height)}</div>
-                          </div>
-                          <span>${parseInt(styles.paddingRight)}</span>
-                        </div>
-                        <div class="eip-box-values"><span>${parseInt(styles.paddingBottom)}</span></div>
-                      </div>
-                      <span>${parseInt(styles.borderRightWidth)}</span>
+                <span class="eip-box-top">${mt}</span>
+                <span class="eip-box-right">${mr}</span>
+                <span class="eip-box-bottom">${mb}</span>
+                <span class="eip-box-left">${ml}</span>
+                <div class="eip-box-border">
+                  <span class="eip-box-label">border</span>
+                  <span class="eip-box-top">${bt}</span>
+                  <span class="eip-box-right">${br}</span>
+                  <span class="eip-box-bottom">${bb}</span>
+                  <span class="eip-box-left">${bl}</span>
+                  <div class="eip-box-padding">
+                    <span class="eip-box-label">padding</span>
+                    <span class="eip-box-top">${pt}</span>
+                    <span class="eip-box-right">${pr}</span>
+                    <span class="eip-box-bottom">${pb}</span>
+                    <span class="eip-box-left">${pl}</span>
+                    <div class="eip-box-content">
+                      <span>${w} × ${h}</span>
                     </div>
-                    <div class="eip-box-values"><span>${parseInt(styles.borderBottomWidth)}</span></div>
                   </div>
-                  <span>${parseInt(styles.marginRight)}</span>
                 </div>
-                <div class="eip-box-values"><span>${parseInt(styles.marginBottom)}</span></div>
               </div>
             </div>
           </div>
@@ -478,7 +611,7 @@
 
         <div class="eip-section eip-actions-section">
           <button class="eip-copy-btn eip-copy-css">${icons.copy} Copiar CSS</button>
-          <div class="eip-shortcut-hint"><kbd>C</kbd> copiar color • <kbd>A</kbd> ver assets</div>
+          <div class="eip-shortcut-hint"><kbd>C</kbd> copiar color bajo cursor • <kbd>A</kbd> assets</div>
         </div>
       </div>
     `;
@@ -502,11 +635,8 @@
     state.panel.querySelectorAll(".eip-color-card").forEach((card) => {
       card.addEventListener("click", () => {
         const color = card.dataset.color;
-        const type = card.dataset.type;
         copyToClipboard(color);
-        showToast(
-          `${type === "bg" ? "Background" : "Color"} copiado: ${color}`,
-        );
+        showToast(`Color copiado: ${color}`);
         card.classList.add("copied");
         setTimeout(() => card.classList.remove("copied"), 1500);
       });
@@ -562,31 +692,6 @@
     document.removeEventListener("mouseup", stopDrag);
   }
 
-  function copyColorUnderCursor() {
-    if (!state.currentElement) return;
-    const styles = window.getComputedStyle(state.currentElement);
-    const bgColor = rgbToHex(styles.backgroundColor);
-    const textColor = rgbToHex(styles.color);
-    const colorToCopy = bgColor !== "transparent" ? bgColor : textColor;
-    copyToClipboard(colorToCopy);
-    showToast(`Color copiado: ${colorToCopy}`);
-  }
-
-  function copyElementColor() {
-    if (!state.currentElement) return;
-    const styles = window.getComputedStyle(state.currentElement);
-    const color = rgbToHex(styles.color);
-    copyToClipboard(color);
-    showToast(`Color copiado: ${color}`);
-    const colorCard = state.panel?.querySelector(
-      '.eip-color-card[data-type="text"]',
-    );
-    if (colorCard) {
-      colorCard.classList.add("copied");
-      setTimeout(() => colorCard.classList.remove("copied"), 1500);
-    }
-  }
-
   function copyElementCSS() {
     if (!state.currentElement) return;
     const styles = window.getComputedStyle(state.currentElement);
@@ -609,7 +714,7 @@
       "box-shadow",
       "opacity",
     ];
-    let css = "/* Inspector 4 dev - CSS Export */\n.element {\n";
+    let css = "/* Inspector 4 dev */\n.element {\n";
     cssProperties.forEach((prop) => {
       const value = styles.getPropertyValue(prop);
       if (value && value !== "none" && value !== "normal")
@@ -639,7 +744,7 @@
       .map((c) => `.${c}`)
       .join("");
     const selector = id || className || tagName;
-    let css = `/* Inspector 4 dev - Full CSS Export */\n/* Selector: ${selector} */\n\n${selector} {\n`;
+    let css = `/* Inspector 4 dev - Full Export */\n${selector} {\n`;
     const props = [
       "font-family",
       "font-size",
@@ -779,7 +884,7 @@
 
     return `
       <div class="eip-assets-header">
-        <h3>${icons.assets} Assets de la página <span class="eip-assets-count">${totalAssets}</span></h3>
+        <h3>${icons.assets} Assets <span class="eip-assets-count">${totalAssets}</span></h3>
         <button class="eip-btn eip-btn-close">${icons.close}</button>
       </div>
       <div class="eip-assets-content">
@@ -841,13 +946,12 @@
               ${icons.image} SVGs (${assets.svgs.length})
               <span class="eip-svgs-toggle">${icons.chevron}</span>
             </h4>
-            <div class="eip-assets-grid eip-svgs-grid" ${svgsCollapsed ? 'style="display:none"' : ""}>
-            </div>
+            <div class="eip-assets-grid eip-svgs-grid" ${svgsCollapsed ? 'style="display:none"' : ""}></div>
           </div>
         `
             : ""
         }
-        ${totalAssets === 0 ? `<div class="eip-assets-empty"><span>No se encontraron assets en esta página</span></div>` : ""}
+        ${totalAssets === 0 ? `<div class="eip-assets-empty"><span>No se encontraron assets</span></div>` : ""}
       </div>
       <div class="eip-assets-footer">
         <button class="eip-download-all-btn" ${totalAssets === 0 ? "disabled" : ""}>${icons.download} Descargar todo (${totalAssets})</button>
@@ -878,9 +982,7 @@
         if (isCollapsed) {
           svgsSection.classList.remove("collapsed");
           svgsGrid.style.display = "grid";
-          if (svgsGrid.children.length === 0) {
-            loadSvgs(assets.svgs, svgsGrid);
-          }
+          if (svgsGrid.children.length === 0) loadSvgs(assets.svgs, svgsGrid);
         } else {
           svgsSection.classList.add("collapsed");
           svgsGrid.style.display = "none";
@@ -988,7 +1090,13 @@
     if (existing) existing.remove();
     const toast = document.createElement("div");
     toast.className = `eip-toast eip-toast-${type}`;
-    toast.innerHTML = `${type === "success" ? icons.check : icons.close}<span>${message}</span>`;
+    const icon =
+      type === "success"
+        ? icons.check
+        : type === "error"
+          ? icons.close
+          : icons.eyedropper;
+    toast.innerHTML = `${icon}<span>${message}</span>`;
     document.body.appendChild(toast);
     requestAnimationFrame(() => toast.classList.add("show"));
     setTimeout(() => {
